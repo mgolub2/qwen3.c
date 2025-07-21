@@ -5,7 +5,7 @@ CC = gcc
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
 run: runq.c
-	$(CC) -O3 -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
+	$(CC) -O3 -std=c99 -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
@@ -44,6 +44,11 @@ gnu:
 .PHONY: gnuopenmp
 gnuopenmp:
 	$(CC) -Ofast -fopenmp -std=gnu11 -D_FILE_OFFSET_BITS=64 runq.c  -lm  -o runq
+
+# compiles for big-endian systems (e.g., PowerPC, SPARC)
+.PHONY: bige
+bige: runq.c
+	$(CC) -O3 -std=c99 -DBIG_ENDIAN -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
 
 .PHONY: clean
 clean:

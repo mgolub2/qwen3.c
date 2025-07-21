@@ -1,5 +1,9 @@
 /* Inference for Qwen-3 Transformer model in pure C, int8 quantized forward pass. */
 
+/* To compile for big-endian systems (e.g., PowerPC), add -DBIG_ENDIAN to your compile flags:
+ * gcc -DBIG_ENDIAN -O3 -o runq runq.c -lm
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -7,12 +11,48 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stddef.h>
 #if defined _WIN32
     #include "win.h"
 #else
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+// Endianness detection and conversion functions
+static inline uint32_t swap32(uint32_t val) {
+    return ((val & 0xff000000U) >> 24) |
+           ((val & 0x00ff0000U) >> 8)  |
+           ((val & 0x0000ff00U) << 8)  |
+           ((val & 0x000000ffU) << 24);
+}
+
+static inline uint32_t le_to_host32(uint32_t val) {
+    #ifdef BIG_ENDIAN
+        return swap32(val);
+    #else
+        return val;
+    #endif
+}
+
+static inline uint32_t host_to_le32(uint32_t val) {
+    #ifdef BIG_ENDIAN
+        return swap32(val);
+    #else
+        return val;
+    #endif
+}
+
+static inline void swap_float_bytes(float *val) {
+    uint32_t *int_val = (uint32_t*)val;
+    *int_val = swap32(*int_val);
+}
+
+static inline void le_to_host_float(float *val) {
+    #ifdef BIG_ENDIAN
+        swap_float_bytes(val);
+    #endif
+}
 
 // ----------------------------------------------------------------------------
 // Globals
@@ -109,8 +149,20 @@ void malloc_run_state(RunState* s, Config *p) {
     s->q = calloc(all_heads_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
-    s->key_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
+    
+    uint64_t cache_size = p->n_layers * (uint64_t)p->seq_len * kv_dim;
+    
+    s->key_cache = calloc(cache_size, sizeof(float));
+    s->value_cache = calloc(cache_size, sizeof(float));
+    
+    // Verify that the allocated memory ranges are valid by testing access to the end
+    if (s->key_cache && s->value_cache) {
+        // Test write access to the last element to ensure the full range is available
+        volatile float *test_key_end = s->key_cache + cache_size - 1;
+        volatile float *test_value_end = s->value_cache + cache_size - 1;
+        *test_key_end = 0.0f;
+        *test_value_end = 0.0f;
+    }
 
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
@@ -174,11 +226,35 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         // map quantized int8 values
         res[i].q = (int8_t*)*ptr;
         *ptr = (int8_t*)*ptr + size_each;
-        // map scale factors
-        res[i].s = (float*)*ptr;
-        *ptr = (float*)*ptr + size_each / GS;
+        
+        // For scale factors, we need to copy and convert rather than modify in place
+        int num_scales = size_each / GS;
+        res[i].s = malloc(num_scales * sizeof(float));
+        
+        #ifdef BIG_ENDIAN
+            // Copy scale factors and convert endianness
+            float *source_scales = (float*)*ptr;
+            for (int j = 0; j < num_scales; j++) {
+                res[i].s[j] = source_scales[j];
+                le_to_host_float(&res[i].s[j]);
+            }
+        #else
+            // Just copy the scale factors
+            memcpy(res[i].s, *ptr, num_scales * sizeof(float));
+        #endif
+        
+        *ptr = (float*)*ptr + num_scales;
     }
     return res;
+}
+
+void free_quantized_tensors(QuantizedTensor *tensors, int n) {
+    if (tensors) {
+        for (int i = 0; i < n; i++) {
+            free(tensors[i].s);
+        }
+        free(tensors);
+    }
 }
 
 void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
@@ -186,14 +262,33 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     float *fptr = (float*) ptr; // cast our pointer to float*
 
     w->rms_att_weight = fptr;
+    #ifdef BIG_ENDIAN
+        for (int i = 0; i < p->n_layers * p->dim; i++) le_to_host_float(&fptr[i]);
+    #endif
     fptr += p->n_layers * p->dim;
+    
     w->rms_ffn_weight = fptr;
+    #ifdef BIG_ENDIAN
+        for (int i = 0; i < p->n_layers * p->dim; i++) le_to_host_float(&fptr[i]);
+    #endif
     fptr += p->n_layers * p->dim;
+    
     w->rms_final_weight = fptr;
+    #ifdef BIG_ENDIAN
+        for (int i = 0; i < p->dim; i++) le_to_host_float(&fptr[i]);
+    #endif
     fptr += p->dim;
+    
     w->q_norm_weights = fptr;
+    #ifdef BIG_ENDIAN
+        for (int i = 0; i < p->n_layers * p->head_dim; i++) le_to_host_float(&fptr[i]);
+    #endif
     fptr += p->n_layers * p->head_dim;
+    
     w->k_norm_weights = fptr;
+    #ifdef BIG_ENDIAN
+        for (int i = 0; i < p->n_layers * p->head_dim; i++) le_to_host_float(&fptr[i]);
+    #endif
     fptr += p->n_layers * p->head_dim;
 
     // now read all the quantized weights
@@ -227,14 +322,42 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
         *file_size = ftell(file); // get the file size, in bytes
     #endif
 
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
+    *data = mmap(NULL, *file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fileno(file), 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     fclose(file);
 
     // checkpoint format is 256-byte header, and then the model weights
 
-    memcpy(config, *data, sizeof(Config));
-    if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }
+    // Read Config struct field by field to handle alignment properly
+    char *ptr = (char*)*data;
+    memcpy(&config->magic_number, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->version, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->dim, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->hidden_dim, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->n_layers, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->n_heads, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->n_kv_heads, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->vocab_size, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->seq_len, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->head_dim, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->shared_classifier, ptr, sizeof(int)); ptr += sizeof(int);
+    memcpy(&config->group_size, ptr, sizeof(int));
+    
+    // Convert from little-endian to host byte order
+    config->magic_number = le_to_host32(config->magic_number);
+    config->version = le_to_host32(config->version);
+    config->dim = le_to_host32(config->dim);
+    config->hidden_dim = le_to_host32(config->hidden_dim);
+    config->n_layers = le_to_host32(config->n_layers);
+    config->n_heads = le_to_host32(config->n_heads);
+    config->n_kv_heads = le_to_host32(config->n_kv_heads);
+    config->vocab_size = le_to_host32(config->vocab_size);
+    config->seq_len = le_to_host32(config->seq_len);
+    config->head_dim = le_to_host32(config->head_dim);
+    config->shared_classifier = le_to_host32(config->shared_classifier);
+    config->group_size = le_to_host32(config->group_size);
+    
+    if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint: %d\n", checkpoint, config->magic_number); exit(EXIT_FAILURE); }
     if (config->version != 1) { fprintf(stderr, "Checkpoint %s is version %d, need version 1\n", checkpoint, config->version); exit(EXIT_FAILURE); }
 
     if (ctx_length != 0 && ctx_length <= config->seq_len)
@@ -254,17 +377,18 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
 }
 
 void free_transformer(Transformer *t) {
-    // free QuantizedTensors
-    free(t->weights.q_tokens);
+    Config *p = &t->config;
+    // free QuantizedTensors properly
+    free_quantized_tensors(t->weights.q_tokens, 1);
     free(t->weights.token_embedding_table);
-    free(t->weights.wq);
-    free(t->weights.wk);
-    free(t->weights.wv);
-    free(t->weights.wo);
-    free(t->weights.w1);
-    free(t->weights.w2);
-    free(t->weights.w3);
-    if(t->weights.wcls != t->weights.q_tokens) free(t->weights.wcls);
+    free_quantized_tensors(t->weights.wq, p->n_layers);
+    free_quantized_tensors(t->weights.wk, p->n_layers);
+    free_quantized_tensors(t->weights.wv, p->n_layers);
+    free_quantized_tensors(t->weights.wo, p->n_layers);
+    free_quantized_tensors(t->weights.w1, p->n_layers);
+    free_quantized_tensors(t->weights.w2, p->n_layers);
+    free_quantized_tensors(t->weights.w3, p->n_layers);
+    if(t->weights.wcls != t->weights.q_tokens) free_quantized_tensors(t->weights.wcls, 1);
     // close the memory mapping
     if (t->data != MAP_FAILED) munmap(t->data, t->file_size);
     // free the RunState buffers
@@ -360,7 +484,7 @@ float *forward(Transformer *transformer, int token, int pos) {
         /* ------------ Q-RMSNorm + rotate each query head ------------- */
         for (int h = 0; h < p->n_heads; h++) {
             float *q = s->q + h * p->head_dim;
-
+            
             rmsnorm(q, q, w->q_norm_weights + l * p->head_dim, p->head_dim);
             for (int j = 0; j < p->head_dim/2; j++) {
                 float freq = powf(1e6, -(float)j / (p->head_dim/2));
@@ -513,6 +637,11 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     fread(&t->max_token_length, sizeof(int), 1, file);
     fread(&t->bos_token_id, sizeof(int), 1, file);
     fread(&t->eos_token_id, sizeof(int), 1, file);
+    
+    // Convert from little-endian to host byte order
+    t->max_token_length = le_to_host32(t->max_token_length);
+    t->bos_token_id = le_to_host32(t->bos_token_id);
+    t->eos_token_id = le_to_host32(t->eos_token_id);
 
     int len;
 
@@ -521,7 +650,11 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
             t->vocab[i] = (char *)malloc(1);
             t->vocab[i][0] = 0; // add the string terminating token
         } else {
+            // Convert float from little-endian to host byte order
+            le_to_host_float(&t->merge_scores[i]);
+            
             fread(&len, sizeof(int), 1, file);
+            len = le_to_host32(len); // Convert length from little-endian
             t->vocab[i] = (char *)malloc(len + 1);
             fread(t->vocab[i], 1, len, file);
             t->vocab[i][len] = 0; // add the string terminating token
@@ -921,6 +1054,88 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 }
 
 // ----------------------------------------------------------------------------
+// benchmark loop
+
+void benchmark(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int num_tokens) {
+    char *default_prompt = "Once upon a time";
+    if (prompt == NULL) { prompt = default_prompt; }
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    int *prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    encode(tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        fprintf(stderr, "Please provide a prompt using -i <string> on the command line.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // limit num_tokens to context window minus prompt
+    int max_tokens = transformer->config.seq_len - num_prompt_tokens;
+    if (num_tokens <= 0 || num_tokens > max_tokens) {
+        num_tokens = (max_tokens < 256) ? max_tokens : 256;  // default to 256 tokens or max available
+    }
+
+    printf("Running benchmark...\n");
+    printf("Prompt: %s\n", prompt);
+    printf("Prompt tokens: %d\n", num_prompt_tokens);
+    printf("Generating %d tokens...\n\n", num_tokens);
+
+    // start timing after the prompt processing
+    clock_t start_time = clock();
+    
+    // start the main loop
+    int next;        // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;     // position in the sequence
+    int tokens_generated = 0;
+
+    while (pos < transformer->config.seq_len && tokens_generated < num_tokens) {
+        // forward the transformer to get logits for the next token
+        float *logits = forward(transformer, token, pos);
+
+        // advance the state state machine
+        if (pos < num_prompt_tokens - 1) {
+            // if we are still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos + 1];
+        } else {
+            // otherwise sample the next token from the logits
+            next = sample(sampler, logits);
+            tokens_generated++;
+        }
+        pos++;
+
+        // don't print tokens in benchmark mode to avoid I/O overhead
+        token = next;
+
+        // data-dependent terminating condition: the BOS/EOS token delimits sequences
+        if (pos >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id)) {
+            tokens_generated--; // don't count the EOS token
+            break;
+        }
+    }
+
+    // stop timing
+    clock_t end_time = clock();
+    double time_elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+
+    // calculate and print statistics
+    printf("\n\nBenchmark Results:\n");
+    printf("==================\n");
+    printf("Total tokens generated: %d\n", tokens_generated);
+    printf("Total time: %.3f seconds\n", time_elapsed);
+    
+    if (time_elapsed > 0 && tokens_generated > 0) {
+        double tokens_per_second = tokens_generated / time_elapsed;
+        double ms_per_token = (time_elapsed * 1000.0) / tokens_generated;
+        printf("Tokens per second: %.2f\n", tokens_per_second);
+        printf("Milliseconds per token: %.2f\n", ms_per_token);
+    }
+    
+    printf("\n");
+    free(prompt_tokens);
+}
+
+// ----------------------------------------------------------------------------
 // CLI
 
 void error_usage() {
@@ -931,10 +1146,11 @@ void error_usage() {
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: chat\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|benchmark, default: chat\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
+    fprintf(stderr, "  -n <int>    number of tokens to generate in benchmark mode, default 256\n");
     exit(EXIT_FAILURE);
 }
 
@@ -945,10 +1161,11 @@ int main(int argc, char *argv[]) {
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "chat";        // generate|chat
+    char *mode = "chat";        // generate|chat|benchmark
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
     int ctx_length = 0;         // context length
+    int num_tokens = 256;       // number of tokens to generate in benchmark mode
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -966,6 +1183,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'n') { num_tokens = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
 
@@ -994,6 +1212,8 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);
+    } else if (strcmp(mode, "benchmark") == 0) {
+        benchmark(&transformer, &tokenizer, &sampler, prompt, num_tokens);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode);
         error_usage();
