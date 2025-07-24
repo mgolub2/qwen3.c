@@ -1,7 +1,8 @@
 /* Inference for Qwen-3 Transformer model in pure C, int8 quantized forward pass. */
 
-/* To compile for big-endian systems (e.g., PowerPC), add -DBIG_ENDIAN to your compile flags:
- * gcc -DBIG_ENDIAN -O3 -o runq runq.c -lm
+/* Endianness is now automatically detected. To compile:
+ * gcc -O3 -o runq runq.c -lm
+ * For big-endian systems, you can still force it with -DBIG_ENDIAN if needed.
  */
 
 #include <stdio.h>
@@ -20,6 +21,22 @@
 #endif
 
 // Endianness detection and conversion functions
+// Proper endianness detection using standard compiler macros
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    #define IS_BIG_ENDIAN 1
+#elif defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    #define IS_BIG_ENDIAN 0
+#elif defined(BIG_ENDIAN) || defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN)
+    #define IS_BIG_ENDIAN 1
+#elif defined(__ARMEL__) || defined(__THUMBEL__) || defined(__AARCH64EL__) || \
+      defined(_MIPSEL) || defined(__MIPSEL) || defined(__MIPSEL__) || \
+      defined(__LITTLE_ENDIAN__) || defined(_LITTLE_ENDIAN)
+    #define IS_BIG_ENDIAN 0
+#else
+    // Default to little endian for most modern systems
+    #define IS_BIG_ENDIAN 0
+#endif
+
 static inline uint32_t swap32(uint32_t val) {
     return ((val & 0xff000000U) >> 24) |
            ((val & 0x00ff0000U) >> 8)  |
@@ -28,7 +45,7 @@ static inline uint32_t swap32(uint32_t val) {
 }
 
 static inline uint32_t le_to_host32(uint32_t val) {
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         return swap32(val);
     #else
         return val;
@@ -36,7 +53,7 @@ static inline uint32_t le_to_host32(uint32_t val) {
 }
 
 static inline uint32_t host_to_le32(uint32_t val) {
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         return swap32(val);
     #else
         return val;
@@ -49,7 +66,7 @@ static inline void swap_float_bytes(float *val) {
 }
 
 static inline void le_to_host_float(float *val) {
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         swap_float_bytes(val);
     #endif
 }
@@ -231,7 +248,7 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         int num_scales = size_each / GS;
         res[i].s = malloc(num_scales * sizeof(float));
         
-        #ifdef BIG_ENDIAN
+        #if IS_BIG_ENDIAN
             // Copy scale factors and convert endianness
             float *source_scales = (float*)*ptr;
             for (int j = 0; j < num_scales; j++) {
@@ -262,31 +279,31 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     float *fptr = (float*) ptr; // cast our pointer to float*
 
     w->rms_att_weight = fptr;
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         for (int i = 0; i < p->n_layers * p->dim; i++) le_to_host_float(&fptr[i]);
     #endif
     fptr += p->n_layers * p->dim;
     
     w->rms_ffn_weight = fptr;
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         for (int i = 0; i < p->n_layers * p->dim; i++) le_to_host_float(&fptr[i]);
     #endif
     fptr += p->n_layers * p->dim;
     
     w->rms_final_weight = fptr;
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         for (int i = 0; i < p->dim; i++) le_to_host_float(&fptr[i]);
     #endif
     fptr += p->dim;
     
     w->q_norm_weights = fptr;
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         for (int i = 0; i < p->n_layers * p->head_dim; i++) le_to_host_float(&fptr[i]);
     #endif
     fptr += p->n_layers * p->head_dim;
     
     w->k_norm_weights = fptr;
-    #ifdef BIG_ENDIAN
+    #if IS_BIG_ENDIAN
         for (int i = 0; i < p->n_layers * p->head_dim; i++) le_to_host_float(&fptr[i]);
     #endif
     fptr += p->n_layers * p->head_dim;
